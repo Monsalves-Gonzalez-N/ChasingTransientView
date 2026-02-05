@@ -1,1 +1,20 @@
-Hello World
+# Programmatic Access to Astronomical Objects in a Sky Region
+
+This script enables automated querying of astronomical objects within a defined localization radius, combining deep survey data with all-sky resources.
+
+## Part 1 — Legacy Survey DR10
+
+Performs direct SQL queries to **Legacy Survey DR10** via `dl.queryClient`, similar to the official web tool. Visualization includes:
+
+- Detected sources (red circles)
+- Search radius (yellow circle)
+- Optional survey background (e.g., Pan-STARRS, WISE)
+
+## Part 2 — NED and All-Sky Surveys
+
+Fallback for regions **not covered by Legacy Survey**, using `astroquery` to access objects from **NED** and visualize with all-sky surveys.
+
+## Requirements
+
+All dependencies are listed in the `environment.yml` file.
+
