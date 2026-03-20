@@ -2,6 +2,15 @@
 
 Query galaxy catalogs within a sky localization region (gravitational wave, GRB, fast radio burst, etc.), compute the chance alignment probability for each source, and visualize results interactively with an ipyaladin widget.
 
+```bash
+conda env create -f datalab.yml
+```
+```bash
+conda activate datalab && python query_localization.py --ra 155.5216 --dec -20.9972 --error 0.73arcmin
+```
+
+---
+
 ## Installation
 
 ### 1. Conda environment
