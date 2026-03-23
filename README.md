@@ -56,7 +56,7 @@ The script prints a source table to the terminal and opens a Jupyter Lab noteboo
 
 ## Output
 
-**Terminal table** — extended sources sorted by P_cc (4 significant figures):
+**Terminal table** — extended sources sorted by P_cc (4 significant digits):
 
 | Column | Description |
 |---|---|
