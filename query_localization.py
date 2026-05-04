@@ -65,21 +65,28 @@ def _mag_from_nanomaggy(flux: np.ndarray) -> np.ndarray:
     return mag
 
 
-def chance_alignment_prob(offset_arcsec: np.ndarray, mag_r: np.ndarray) -> np.ndarray:
+def chance_alignment_prob(
+    offset_arcsec: np.ndarray,
+    mag_r: np.ndarray,
+    loc_error_arcsec: float,
+) -> np.ndarray:
     """
     Bloom et al. (2002) chance coincidence probability.
 
-        P_cc = 1 - exp(-pi * offset^2 * sigma(< m_r))
+        P_cc = 1 - exp(-pi * r^2 * sigma(<m_r))
 
-    where sigma(<m_r) [per arcsec^2] is the cumulative surface density of
-    galaxies brighter than m_r (r-band AB), approximated as:
+    Effective radius (accounts for localization error):
+        r = loc_error_arcsec           if loc_error > offset
+        r = sqrt(offset^2 + err^2)     otherwise
 
-        sigma(<m_r) = (1/3600) * 10^(0.33 * (m_r - 24))
+    Surface density (Bloom 2002 eq. 3, r-band):
+        sigma(<m_r) = 10^(0.334*(m_r - 22.963) + 4.32) / (3600^2 * 0.334 * ln10)
 
     Parameters
     ----------
-    offset_arcsec : angular separation from the transient (arcsec)
-    mag_r         : r-band AB magnitude of the galaxy
+    offset_arcsec    : angular separation from the transient (arcsec)
+    mag_r            : r-band AB magnitude of the galaxy
+    loc_error_arcsec : 1-sigma localization radius (arcsec)
 
     Returns
     -------
@@ -87,8 +94,12 @@ def chance_alignment_prob(offset_arcsec: np.ndarray, mag_r: np.ndarray) -> np.nd
     """
     offset = np.asarray(offset_arcsec, dtype=float)
     mag_r  = np.asarray(mag_r, dtype=float)
-    sigma  = (1.0 / 3600.0) * 10.0 ** (0.33 * (mag_r - 24.0))   # per arcsec²
-    p_cc   = 1.0 - np.exp(-np.pi * offset**2 * sigma)
+    err    = float(loc_error_arcsec)
+
+    r     = np.where(err > offset, err, np.sqrt(offset**2 + err**2))
+    norm  = (3600.0**2) * 0.334 * np.log(10.0)
+    sigma = 10.0 ** (0.334 * (mag_r - 22.963) + 4.32) / norm
+    p_cc  = 1.0 - np.exp(-np.pi * r**2 * sigma)
     return np.where(np.isfinite(p_cc), np.clip(p_cc, 0.0, 1.0), np.nan)
 
 
@@ -110,13 +121,13 @@ def query_legacy(ra: float, dec: float, loc_error: u.Quantity) -> pd.DataFrame:
     radius_deg = loc_error.to(u.deg).value
     query = f"""
 WITH cone AS (
-    SELECT ls_id, ra, dec, type, flux_r
+    SELECT ls_id, ra, dec, type, flux_r, mw_transmission_r
     FROM ls_dr10.tractor
     WHERE q3c_radial_query(ra, dec, {ra}, {dec}, {radius_deg})
       AND type != 'PSF'
       AND maskbits = 0
 )
-SELECT c.ls_id, c.ra, c.dec, c.type, c.flux_r,
+SELECT c.ls_id, c.ra, c.dec, c.type, c.flux_r, c.mw_transmission_r,
        p.z_phot_mean, p.z_spec, p.z_phot_std
 FROM cone c
 JOIN ls_dr10.photo_z p ON c.ls_id = p.ls_id
@@ -136,12 +147,18 @@ WHERE p.z_phot_mean IS NOT NULL;
     sources = SkyCoord(df["ra"].values, df["dec"].values, unit="deg", frame="icrs")
     df["offset_arcsec"] = target.separation(sources).to(u.arcsec).value
 
-    # r-band AB magnitude from nanomaggies
+    # r-band AB magnitude from nanomaggies, then Galactic-extinction corrected
+    # mw_transmission_r is the fraction of flux transmitted; dividing removes dust attenuation
     df["mag_r"] = _mag_from_nanomaggy(df["flux_r"].values)
+    trans = pd.to_numeric(df["mw_transmission_r"], errors="coerce").values
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ext_corr = np.where((trans > 0) & np.isfinite(trans), -2.5 * np.log10(trans), np.nan)
+    df["mag_r_corr"] = df["mag_r"] - ext_corr   # subtract extinction (brighter after correction)
 
-    # Chance alignment probability — "no_mag_r" when flux_r is missing
-    p_cc = chance_alignment_prob(df["offset_arcsec"].values, df["mag_r"].values)
-    df["P_cc"] = np.where(df["mag_r"].isna(), "no_mag_r", p_cc.round(6).astype(str))
+    # Chance alignment probability uses extinction-corrected magnitude
+    loc_error_arcsec = loc_error.to(u.arcsec).value
+    p_cc = chance_alignment_prob(df["offset_arcsec"].values, df["mag_r_corr"].values, loc_error_arcsec)
+    df["P_cc"] = np.where(df["mag_r_corr"].isna(), "no_mag_r", p_cc.round(6).astype(str))
 
     return df
 
@@ -229,13 +246,13 @@ def open_aladin(
                 "# ── DataLab query (Legacy Survey DR10) ───────────────────────\n"
                 f"query = \"\"\"\n"
                 f"WITH cone AS (\n"
-                f"    SELECT ls_id, ra, dec, type, flux_r\n"
+                f"    SELECT ls_id, ra, dec, type, flux_r, mw_transmission_r\n"
                 f"    FROM ls_dr10.tractor\n"
                 f"    WHERE q3c_radial_query(ra, dec, {ra}, {dec}, {radius_deg})\n"
                 f"      AND type != 'PSF'\n"
                 f"      AND maskbits = 0\n"
                 f")\n"
-                f"SELECT c.ls_id, c.ra, c.dec, c.type, c.flux_r,\n"
+                f"SELECT c.ls_id, c.ra, c.dec, c.type, c.flux_r, c.mw_transmission_r,\n"
                 f"       p.z_phot_mean, p.z_spec, p.z_phot_std\n"
                 f"FROM cone c\n"
                 f"JOIN ls_dr10.photo_z p ON c.ls_id = p.ls_id\n"
@@ -248,15 +265,25 @@ def open_aladin(
                 "sources = SkyCoord(df_ls['ra'].values, df_ls['dec'].values, unit='deg', frame='icrs')\n"
                 "df_ls['offset_arcsec'] = target.separation(sources).arcsec\n"
                 "\n"
-                "# r-band AB magnitude from nanomaggies\n"
+                "# r-band AB magnitude from nanomaggies, corrected for Galactic extinction\n"
+                "# mw_transmission_r = fraction of flux transmitted (from SFD dust map)\n"
                 "flux = df_ls['flux_r'].values.astype(float)\n"
                 "df_ls['mag_r'] = np.where(flux > 0, 22.5 - 2.5 * np.log10(np.where(flux > 0, flux, np.nan)), np.nan)\n"
+                "trans = df_ls['mw_transmission_r'].values.astype(float)\n"
+                "ext_corr = np.where((trans > 0) & np.isfinite(trans), -2.5 * np.log10(np.where(trans > 0, trans, np.nan)), np.nan)\n"
+                "df_ls['mag_r_corr'] = df_ls['mag_r'] - ext_corr\n"
                 "\n"
-                "# Chance alignment probability (Bloom et al. 2002)\n"
-                "# P_cc = 1 - exp(-pi * offset^2 * sigma(<mag_r)),  sigma in arcsec^-2\n"
-                "sigma = (1.0 / 3600.0) * 10.0 ** (0.33 * (df_ls['mag_r'] - 24.0))\n"
-                "p_cc_vals = 1.0 - np.exp(-np.pi * df_ls['offset_arcsec'] ** 2 * sigma)\n"
-                "df_ls['P_cc'] = np.where(df_ls['mag_r'].isna(), 'no_mag_r', p_cc_vals.round(6).astype(str))\n"
+                "# Chance alignment probability (Bloom et al. 2002) — uses extinction-corrected magnitude\n"
+                "# r = err if err > offset else sqrt(offset^2 + err^2)\n"
+                "# sigma(<m) = 10^(0.334*(m-22.963)+4.32) / (3600^2 * 0.334 * ln10)\n"
+                "# P_cc = 1 - exp(-pi * r^2 * sigma)\n"
+                f"err_arcsec = {radius_deg * 3600.0}\n"
+                "offset = df_ls['offset_arcsec'].values\n"
+                "r = np.where(err_arcsec > offset, err_arcsec, np.sqrt(offset**2 + err_arcsec**2))\n"
+                "norm = (3600.0**2) * 0.334 * np.log(10.0)\n"
+                "sigma = 10.0 ** (0.334 * (df_ls['mag_r_corr'] - 22.963) + 4.32) / norm\n"
+                "p_cc_vals = 1.0 - np.exp(-np.pi * r**2 * sigma)\n"
+                "df_ls['P_cc'] = np.where(df_ls['mag_r_corr'].isna(), 'no_mag_r', p_cc_vals.round(6).astype(str))\n"
                 "\n"
                 "print(f'{len(df_ls)} extended sources found in Legacy Survey DR10')\n"
                 "\n"
@@ -269,12 +296,12 @@ def open_aladin(
                 "region = CircleSkyRegion(center=center, radius=loc_error_deg * u.deg)\n"
                 "aladin.add_graphic_overlay_from_region([region], color='yellow', linewidth=2)\n"
                 "\n"
-                "t_ls = Table.from_pandas(df_ls[['ra', 'dec', 'type', 'z_phot_mean', 'mag_r', 'offset_arcsec', 'P_cc']])\n"
+                "t_ls = Table.from_pandas(df_ls[['ra', 'dec', 'type', 'z_phot_mean', 'mag_r', 'mag_r_corr', 'offset_arcsec', 'P_cc']])\n"
                 "aladin.add_table(t_ls, color='red', shape='circle')\n"
                 "\n"
                 "# ── Table sorted by P_cc ────────────────────────────────────\n"
                 "df_display = df_ls.copy()\n"
-                "for col in ['z_phot_mean', 'mag_r', 'offset_arcsec']:\n"
+                "for col in ['z_phot_mean', 'mag_r', 'mag_r_corr', 'offset_arcsec']:\n"
                 "    df_display[col] = df_display[col].apply(lambda x: f'{x:.4g}' if pd.notna(x) else x)\n"
                 "df_display['P_cc'] = pd.to_numeric(df_display['P_cc'], errors='coerce').apply(\n"
                 "    lambda x: f'{x:.4g}' if pd.notna(x) else 'no_mag_r'\n"
@@ -321,8 +348,24 @@ def open_aladin(
                 "region = CircleSkyRegion(center=center, radius=loc_error_deg * u.deg)\n"
                 "aladin.add_graphic_overlay_from_region([region], color='yellow', linewidth=2)\n"
                 "\n"
+                "# ── Galactic extinction at transient position (SFD98 via IRSA) ──\n"
+                "# R_B = 4.07 (Schlafly & Finkbeiner 2011)\n"
+                "try:\n"
+                "    from astroquery.irsa_dust import IrsaDust\n"
+                "    dust_table = IrsaDust.get_extinction_table(center)\n"
+                "    ebv = float(dust_table['E(B-V)'][0])   # SFD E(B-V)\n"
+                "    A_r = 2.285 * ebv\n"
+                "    print(f'E(B-V) = {ebv:.4f},  A_r = {A_r:.4f} mag')\n"
+                "except Exception as e:\n"
+                "    A_r = 0.0\n"
+                "    print(f'[WARNING] Could not get dust extinction: {e}. Using A_B = 0.')\n"
+                "\n"
                 "# ── GLADE+ (VII/291) — all-sky galaxy catalog ───────────────\n"
-                "# P_cc computed with Bmag (approximation to r-band)\n"
+                "# B → r empirical conversion from 50-region GLADE × Legacy Survey DR10 cross-match:\n"
+                "# B = 1.0645·r + 0.0366  →  r = (B − 0.0366) / 1.0645  (both magnitudes uncorrected)\n"
+                "# r-band Galactic extinction applied after conversion (Schlafly & Finkbeiner 2011: R_r = 2.285)\n"
+                "B2R_SLOPE     = 1.0645\n"
+                "B2R_INTERCEPT = 0.0366\n"
                 "try:\n"
                 "    v = Vizier(columns=['RAJ2000','DEJ2000','Dist','z','Bmag','Kmag','W1mag','Type'],\n"
                 "               row_limit=-1)\n"
@@ -332,14 +375,21 @@ def open_aladin(
                 "        sources = SkyCoord(df['ra'].values.astype(float),\n"
                 "                           df['dec'].values.astype(float), unit='deg')\n"
                 "        df['offset_arcsec'] = center.separation(sources).arcsec\n"
-                "        mag  = df['Bmag'].values.astype(float)\n"
-                "        sig  = (1/3600) * 10**(0.33*(mag - 24))\n"
-                "        p_cc = 1 - np.exp(-np.pi * df['offset_arcsec']**2 * sig)\n"
-                "        df['P_cc'] = np.where(np.isnan(mag), 'no_mag', p_cc.round(6).astype(str))\n"
-                "        for col in ['Bmag','Kmag','W1mag','z','Dist','offset_arcsec']:\n"
+                "        mag_r_raw  = (df['Bmag'].values.astype(float) - B2R_INTERCEPT) / B2R_SLOPE\n"
+                "        mag_r_corr = mag_r_raw - A_r\n"
+                "        df['mag_r_est']  = mag_r_raw\n"
+                "        df['mag_r_corr'] = mag_r_corr\n"
+                f"        err_arcsec = {radius_deg * 3600.0}\n"
+                "        off  = df['offset_arcsec'].values\n"
+                "        r    = np.where(err_arcsec > off, err_arcsec, np.sqrt(off**2 + err_arcsec**2))\n"
+                "        norm = (3600.0**2) * 0.334 * np.log(10.0)\n"
+                "        sig  = 10.0 ** (0.334 * (mag_r_corr - 22.963) + 4.32) / norm\n"
+                "        p_cc = 1 - np.exp(-np.pi * r**2 * sig)\n"
+                "        df['P_cc'] = np.where(np.isnan(mag_r_corr), 'no_mag', p_cc.round(6).astype(str))\n"
+                "        for col in ['Bmag','mag_r_est','mag_r_corr','Kmag','W1mag','z','Dist','offset_arcsec']:\n"
                 "            if col in df:\n"
                 "                df[col] = df[col].apply(lambda x: f'{x:.4g}' if pd.notna(x) and x!='' else x)\n"
-                "        keep = [c for c in ['ra','dec','Type','Bmag','Kmag','z','Dist','offset_arcsec','P_cc'] if c in df]\n"
+                "        keep = [c for c in ['ra','dec','Type','Bmag','mag_r_est','mag_r_corr','Kmag','z','Dist','offset_arcsec','P_cc'] if c in df]\n"
                 "        aladin.add_table(Table.from_pandas(df[keep].fillna('')), color='lime', shape='circle')\n"
                 "        df['_sort'] = pd.to_numeric(df['P_cc'], errors='coerce')\n"
                 "        print(f'{len(df)} galaxies in GLADE+ (green in Aladin)')\n"
@@ -373,28 +423,31 @@ def open_aladin(
             ),
             _cell(
                 "# ── Chance Alignment Probability (Bloom et al. 2002) ─────────\n"
-                "# Use to manually compute P_cc given coordinates and magnitude\n"
-                "# of any source seen in Aladin or in the GLADE+/NED table.\n"
-                "#\n"
-                "# P_cc = 1 - exp(-pi * offset^2 * sigma(<mag_r))\n"
-                "# sigma(<mag_r) [per arcsec^2] = (1/3600) * 10^(0.33*(mag_r - 24))\n"
+                "# P_cc = 1 - exp(-pi * r^2 * sigma(<mag_r))\n"
+                "# r = err if err > offset else sqrt(offset^2 + err^2)\n"
+                "# sigma(<m) = 10^(0.334*(m-22.963)+4.32) / (3600^2 * 0.334 * ln10)\n"
                 "\n"
                 "def chance_alignment_prob(ra_gal, dec_gal, mag_r,\n"
-                "                          ra_transient=ra, dec_transient=dec):\n"
+                "                          ra_transient=ra, dec_transient=dec,\n"
+                f"                          loc_error_arcsec={radius_deg * 3600.0}):\n"
                 "    \"\"\"\n"
                 "    Bloom et al. (2002) chance alignment probability.\n"
                 "    Parameters:\n"
-                "        ra_gal, dec_gal : candidate galaxy coordinates (deg)\n"
-                "        mag_r           : galaxy magnitude (ideally r-band AB)\n"
-                "        ra_transient, dec_transient : transient coordinates\n"
+                "        ra_gal, dec_gal  : candidate galaxy coordinates (deg)\n"
+                "        mag_r            : galaxy magnitude (r-band AB)\n"
+                "        loc_error_arcsec : localization radius (arcsec)\n"
                 "    Returns P_cc in [0, 1]  (0 = likely host, 1 = chance coincidence)\n"
                 "    \"\"\"\n"
+                "    import math\n"
                 "    target = SkyCoord(ra_transient, dec_transient, unit='deg', frame='icrs')\n"
                 "    source = SkyCoord(ra_gal, dec_gal, unit='deg', frame='icrs')\n"
                 "    offset_arcsec = target.separation(source).arcsec\n"
-                "    sigma = (1.0 / 3600.0) * 10.0 ** (0.33 * (mag_r - 24.0))\n"
-                "    p_cc  = 1.0 - np.exp(-np.pi * offset_arcsec**2 * sigma)\n"
+                "    r     = loc_error_arcsec if loc_error_arcsec > offset_arcsec else math.sqrt(offset_arcsec**2 + loc_error_arcsec**2)\n"
+                "    norm  = (3600.0**2) * 0.334 * math.log(10.0)\n"
+                "    sigma = 10.0 ** (0.334 * (mag_r - 22.963) + 4.32) / norm\n"
+                "    p_cc  = 1.0 - math.exp(-math.pi * r**2 * sigma)\n"
                 "    print(f'offset = {offset_arcsec:.4g} arcsec')\n"
+                "    print(f'r_eff  = {r:.4g} arcsec')\n"
                 "    print(f'P_cc   = {p_cc:.4g}')\n"
                 "    return p_cc\n"
                 "\n"
@@ -444,10 +497,10 @@ def main() -> None:
     if not df_ls.empty:
         print(f"    {len(df_ls)} extended sources found.\n")
         display_cols = [c for c in ["ls_id", "ra", "dec", "type",
-                                    "z_phot_mean", "mag_r", "offset_arcsec", "P_cc"]
+                                    "z_phot_mean", "mag_r", "mag_r_corr", "offset_arcsec", "P_cc"]
                         if c in df_ls.columns]
         df_print = df_ls[display_cols].copy()
-        for col in ["z_phot_mean", "mag_r", "offset_arcsec"]:
+        for col in ["z_phot_mean", "mag_r", "mag_r_corr", "offset_arcsec"]:
             if col in df_print.columns:
                 df_print[col] = df_print[col].apply(lambda x: f"{x:.4g}" if pd.notna(x) else x)
         df_print["P_cc"] = pd.to_numeric(df_print["P_cc"], errors="coerce").apply(
