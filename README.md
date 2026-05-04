@@ -66,9 +66,9 @@ The script prints a source table to the terminal and opens a Jupyter Lab noteboo
 | `P_cc` | Chance alignment probability (Bloom et al. 2002) |
 
 **Jupyter notebook** — Aladin widget with:
-- Yellow circle marking the localization region
-- Red markers for Legacy Survey sources (Legacy branch)
-- Green markers for GLADE+ galaxies / purple for NED (fallback branch)
+- Semi-transparent yellow circle marking the localization region
+- Semi-transparent red markers for Legacy Survey sources (Legacy branch)
+- Semi-transparent green markers for GLADE+ galaxies / purple for NED (fallback branch)
 
 ---
 
